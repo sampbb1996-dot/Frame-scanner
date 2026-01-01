@@ -1,84 +1,155 @@
-import requests
-from bs4 import BeautifulSoup
-import re
+import time
+from enum import Enum
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
+# -------------------------
+# CONFIG (hard bounds)
+# -------------------------
+
+MAX_ESCALATION_LEVEL = 3
+DECISION_REPEAT_THRESHOLD = 2
+POLL_INTERVAL_SECONDS = 300  # 5 minutes
+
+# -------------------------
+# STATES
+# -------------------------
+
+class EscalationLevel(Enum):
+    PULL_ONLY = 0
+    AUTO_SCOUT = 1
+    DRAFT_ONLY = 2
+    FORCE_SINGLE_ACTION = 3
+
+# -------------------------
+# SYSTEM STATE (no memory)
+# -------------------------
+
+state = {
+    "escalation_level": EscalationLevel.PULL_ONLY,
+    "decision_counter": {},
 }
 
-FRAME_OBJECTS = [
-    {"terms": ["outdoor table", "garden table"], "min_price": 150},
-    {"terms": ["garden bench", "outdoor bench"], "min_price": 120},
-    {"terms": ["outdoor setting", "table and chairs"], "min_price": 250},
-    {"terms": ["wrought iron"], "min_price": 180},
-]
+# -------------------------
+# CORE INVARIANTS
+# -------------------------
 
-FRAME_TOLERANCE = 0.25
-SEARCH_TERMS = ["outdoor", "garden", "bench", "table", "wrought"]
-LOCATION = "sydney"
+def record_decision(decision_key: str):
+    count = state["decision_counter"].get(decision_key, 0) + 1
+    state["decision_counter"][decision_key] = count
 
-BASE_URL = "https://www.gumtree.com.au/s-ads/{}"
+    if count >= DECISION_REPEAT_THRESHOLD:
+        escalate()
 
+def escalate():
+    current = state["escalation_level"].value
+    if current < MAX_ESCALATION_LEVEL:
+        state["escalation_level"] = EscalationLevel(current + 1)
+        reset_decisions()
 
-def parse_price(text):
-    if not text:
-        return None
-    t = text.lower()
-    if "free" in t:
-        return 0
-    nums = re.findall(r"\d+", t.replace(",", ""))
-    return int(nums[0]) if nums else None
+def collapse():
+    state["escalation_level"] = EscalationLevel.PULL_ONLY
+    reset_decisions()
 
+def reset_decisions():
+    state["decision_counter"].clear()
 
-def extract_listings(term):
-    r = requests.get(
-        BASE_URL.format(term),
-        headers=HEADERS,
-        params={"location": LOCATION, "sort": "date"},
-        timeout=15,
-    )
-    soup = BeautifulSoup(r.text, "lxml")
-    listings = []
+# -------------------------
+# DATA SOURCES (STUBS)
+# -------------------------
 
-    for a in soup.select("a[href*='/s-ad/']"):
-        title = a.get_text(strip=True).lower()
-        link = a.get("href")
-        container = a.find_parent("div")
-        price_el = container.select_one(".user-ad-price__price") if container else None
-        price = parse_price(price_el.get_text(strip=True)) if price_el else None
+def fetch_gumtree():
+    """
+    Return list of dicts:
+    { id, title, price, location }
+    """
+    return []
 
-        listings.append({
-            "title": title,
-            "price": price,
-            "link": "https://www.gumtree.com.au" + link,
-        })
+def fetch_marketplace():
+    return []
 
-    return listings
+# -------------------------
+# MECHANICAL FILTERS
+# -------------------------
 
-
-def frame_collapse(listing):
-    if listing["price"] is None:
-        return False
-    for obj in FRAME_OBJECTS:
-        if any(t in listing["title"] for t in obj["terms"]):
-            if listing["price"] < obj["min_price"] * FRAME_TOLERANCE:
-                return True
+def is_mispriced(item):
+    if item["price"] == 0:
+        return True
+    if item["price"] < 0.25 * estimated_resale(item):
+        return True
     return False
 
+def estimated_resale(item):
+    # deliberately dumb and fixed
+    return 60
 
-def main():
-    seen = set()
-    for term in SEARCH_TERMS:
-        for l in extract_listings(term):
-            if l["link"] in seen:
-                continue
-            seen.add(l["link"])
-            if frame_collapse(l):
-                print("FRAME COLLAPSE")
-                print(f"${l['price']} | {l['title']}")
-                print(l["link"])
-                print("----")
+# -------------------------
+# ACTION GENERATION
+# -------------------------
 
+def generate_actions(items):
+    actions = []
+
+    for item in items:
+        if is_mispriced(item):
+            actions.append({
+                "type": "pickup_candidate",
+                "item": item
+            })
+
+    return actions
+
+# -------------------------
+# ESCALATION BEHAVIOUR
+# -------------------------
+
+def handle_actions(actions):
+    level = state["escalation_level"]
+
+    if not actions:
+        return
+
+    if level == EscalationLevel.PULL_ONLY:
+        # Human notices opportunity or not
+        record_decision("send_message")
+
+    elif level == EscalationLevel.AUTO_SCOUT:
+        # Expanded search already handled upstream
+        record_decision("send_message")
+
+    elif level == EscalationLevel.DRAFT_ONLY:
+        draft_message(actions[0])
+        record_decision("confirm_send")
+
+    elif level == EscalationLevel.FORCE_SINGLE_ACTION:
+        send_message(actions[0])
+        collapse()
+
+# -------------------------
+# COMMUNICATION (STUBS)
+# -------------------------
+
+def draft_message(action):
+    item = action["item"]
+    print(f"DRAFT: Hi, I can pick up today. Is this still available? ({item['title']})")
+
+def send_message(action):
+    item = action["item"]
+    print(f"SENT: Message sent for {item['title']}")
+
+# -------------------------
+# MAIN LOOP
+# -------------------------
+
+def run():
+    while True:
+        gumtree_items = fetch_gumtree()
+        marketplace_items = fetch_marketplace()
+
+        all_items = gumtree_items + marketplace_items
+        actions = generate_actions(all_items)
+
+        handle_actions(actions)
+
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
-    main()
+    run()
