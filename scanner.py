@@ -1,155 +1,97 @@
+#!/usr/bin/env python3
+
+import json
+import re
+import sys
 import time
-from enum import Enum
+from urllib.request import Request, urlopen
 
-# -------------------------
-# CONFIG (hard bounds)
-# -------------------------
+import feedparser
 
-MAX_ESCALATION_LEVEL = 3
-DECISION_REPEAT_THRESHOLD = 2
-POLL_INTERVAL_SECONDS = 300  # 5 minutes
 
-# -------------------------
-# STATES
-# -------------------------
+# -----------------------
+# FINAL LAYER INVARIANT
+# -----------------------
+# The program may only emit a task if action is justified.
+# Otherwise, it must emit silence.
 
-class EscalationLevel(Enum):
-    PULL_ONLY = 0
-    AUTO_SCOUT = 1
-    DRAFT_ONLY = 2
-    FORCE_SINGLE_ACTION = 3
 
-# -------------------------
-# SYSTEM STATE (no memory)
-# -------------------------
+BAD_TERMS = re.compile(
+    r"\b(broken|faulty|repair|spares|not working|damaged|as[- ]is)\b",
+    re.IGNORECASE,
+)
 
-state = {
-    "escalation_level": EscalationLevel.PULL_ONLY,
-    "decision_counter": {},
-}
+DURABLE_HINT = re.compile(
+    r"\b(wood|timber|metal|steel|solid|chair|table|bench|cabinet|tool|garden|outdoor)\b",
+    re.IGNORECASE,
+)
 
-# -------------------------
-# CORE INVARIANTS
-# -------------------------
+PRICE_RE = re.compile(r"\$?\s*([0-9][0-9,]*)")
 
-def record_decision(decision_key: str):
-    count = state["decision_counter"].get(decision_key, 0) + 1
-    state["decision_counter"][decision_key] = count
 
-    if count >= DECISION_REPEAT_THRESHOLD:
-        escalate()
+def parse_price(text):
+    if not text:
+        return None
+    m = PRICE_RE.search(text)
+    if not m:
+        return None
+    return int(m.group(1).replace(",", ""))
 
-def escalate():
-    current = state["escalation_level"].value
-    if current < MAX_ESCALATION_LEVEL:
-        state["escalation_level"] = EscalationLevel(current + 1)
-        reset_decisions()
 
-def collapse():
-    state["escalation_level"] = EscalationLevel.PULL_ONLY
-    reset_decisions()
-
-def reset_decisions():
-    state["decision_counter"].clear()
-
-# -------------------------
-# DATA SOURCES (STUBS)
-# -------------------------
-
-def fetch_gumtree():
+def justified(title, summary, price):
     """
-    Return list of dicts:
-    { id, title, price, location }
+    FINAL LAYER: binary permission gate
     """
-    return []
+    if not title or price is None:
+        return False
 
-def fetch_marketplace():
-    return []
+    if price <= 0 or price > 250:
+        return False
 
-# -------------------------
-# MECHANICAL FILTERS
-# -------------------------
+    text = f"{title} {summary}"
 
-def is_mispriced(item):
-    if item["price"] == 0:
-        return True
-    if item["price"] < 0.25 * estimated_resale(item):
-        return True
-    return False
+    if BAD_TERMS.search(text):
+        return False
 
-def estimated_resale(item):
-    # deliberately dumb and fixed
-    return 60
+    if not DURABLE_HINT.search(text):
+        return False
 
-# -------------------------
-# ACTION GENERATION
-# -------------------------
+    return True
 
-def generate_actions(items):
-    actions = []
 
-    for item in items:
-        if is_mispriced(item):
-            actions.append({
-                "type": "pickup_candidate",
-                "item": item
-            })
+def main():
+    with open("config.json", "r") as f:
+        cfg = json.load(f)
 
-    return actions
+    tasks = []
 
-# -------------------------
-# ESCALATION BEHAVIOUR
-# -------------------------
+    for feed_url in cfg["feeds"]:
+        feed = feedparser.parse(feed_url)
 
-def handle_actions(actions):
-    level = state["escalation_level"]
+        for e in feed.entries[:40]:
+            title = e.get("title", "")
+            summary = e.get("summary", "")
+            link = e.get("link", "")
 
-    if not actions:
-        return
+            price = parse_price(title) or parse_price(summary)
 
-    if level == EscalationLevel.PULL_ONLY:
-        # Human notices opportunity or not
-        record_decision("send_message")
+            if justified(title, summary, price):
+                tasks.append({
+                    "action": "review_listing",
+                    "title": title,
+                    "price_aud": price,
+                    "link": link
+                })
 
-    elif level == EscalationLevel.AUTO_SCOUT:
-        # Expanded search already handled upstream
-        record_decision("send_message")
+    # SILENCE IS VALID OUTPUT
+    output = {
+        "timestamp": int(time.time()),
+        "tasks": tasks,
+        "count": len(tasks)
+    }
 
-    elif level == EscalationLevel.DRAFT_ONLY:
-        draft_message(actions[0])
-        record_decision("confirm_send")
+    print(json.dumps(output, ensure_ascii=False))
 
-    elif level == EscalationLevel.FORCE_SINGLE_ACTION:
-        send_message(actions[0])
-        collapse()
-
-# -------------------------
-# COMMUNICATION (STUBS)
-# -------------------------
-
-def draft_message(action):
-    item = action["item"]
-    print(f"DRAFT: Hi, I can pick up today. Is this still available? ({item['title']})")
-
-def send_message(action):
-    item = action["item"]
-    print(f"SENT: Message sent for {item['title']}")
-
-# -------------------------
-# MAIN LOOP
-# -------------------------
-
-def run():
-    while True:
-        gumtree_items = fetch_gumtree()
-        marketplace_items = fetch_marketplace()
-
-        all_items = gumtree_items + marketplace_items
-        actions = generate_actions(all_items)
-
-        handle_actions(actions)
-
-        time.sleep(POLL_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
-    run()
+    sys.exit(main())
