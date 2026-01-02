@@ -1,335 +1,206 @@
 #!/usr/bin/env python3
 """
-deal_radar.py — constraint-first deal monitor with explicit BUY+SELL instructions.
+deal_radar.py — constraint-first deal monitor (RANGES ONLY)
 
 What it does:
-- Polls one or more RSS/Atom feeds (e.g., Gumtree search RSS).
-- Extracts title/link/price.
-- Applies simple "misprice band" rules.
-- Emits *explicit* instruction checklists for:
-    (1) BUY stage (how to message + offer bands)
-    (2) SELL stage (how to list + accept/counter/floor bands)
-- Optional email notification (SMTP) if you set env vars.
+- Polls RSS/Atom feeds (e.g., Gumtree search RSS).
+- Extracts title / link / price.
+- Applies simple mispricing gate.
+- Emits:
+    • review task
+    • non-binding BUY RANGE
+    • non-binding SELL RANGE
+    • reason the listing passed
 
 What it does NOT do:
-- No adaptive negotiation.
-- No stateful learning.
-- No dynamic threshold tuning.
-- No FB Marketplace scraping (use saved searches + RSS where available, or manual inputs).
-
-Requires:
-    pip install feedparser
+- No scripts
+- No negotiation instructions
+- No counters / floors
+- No future commitments
+- No adaptive logic
 """
 
-from __future__ import annotations
-
-import os
 import re
 import time
-import json
 import sqlite3
 import hashlib
-import logging
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Tuple
-
 import feedparser
+from datetime import datetime, timezone
+from typing import Optional, Tuple
 
 # ----------------------------
-# User-editable settings
+# USER SETTINGS (simple)
 # ----------------------------
 
-# Add Gumtree RSS feeds here. You can generate these by doing a search on Gumtree
-# and appending "/rss" in many cases, or using the "RSS" link if present.
 FEEDS = [
-    # مثال:
     # "https://www.gumtree.com.au/s-sydney/bar-stools/k0l3003435r10/rss",
 ]
 
-# Keywords per feed (optional). If empty, accept all items in that feed.
-KEYWORDS = {
-    # feed_url: ["stool", "bar stool", "wicker"]
-}
-
-# Price bands per "category" tag. You can map feeds to categories in FEED_CATEGORY.
-PRICE_BANDS = {
-    # category: (max_buy_price, list_price, accept_at_or_above, floor_price)
-    # "bar_stools": (80, 90, 70, 60),
-}
-
+# Map feed → category
 FEED_CATEGORY = {
     # feed_url: "bar_stools"
 }
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))  # 5 minutes default
-DB_PATH = os.getenv("DB_PATH", "deals.sqlite3")
+# Category price logic (ranges only)
+# category: (max_buy, suggested_list)
+PRICE_LOGIC = {
+    # "bar_stools": (80, 100),
+}
 
-# Optional: set to "1" to print verbose debug info
-DEBUG = os.getenv("DEBUG", "0") == "1"
-
-# Optional Email (SMTP). Leave unset to disable.
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-EMAIL_TO = os.getenv("EMAIL_TO", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER)
-
-# ----------------------------
-# Logging
-# ----------------------------
-
-logging.basicConfig(
-    level=logging.DEBUG if DEBUG else logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-# ----------------------------
-# Data structures
-# ----------------------------
-
-@dataclass
-class Listing:
-    feed_url: str
-    title: str
-    link: str
-    price: Optional[float]  # AUD
-    published: Optional[str]
+POLL_SECONDS = 300
+DB_PATH = "seen.sqlite3"
 
 # ----------------------------
 # Helpers
 # ----------------------------
 
-_PRICE_RE = re.compile(r"\$?\s*([0-9]{1,6})(?:\.[0-9]{1,2})?")
+PRICE_RE = re.compile(r"\$?\s*([0-9]{1,6})")
 
-def parse_price(text: str) -> Optional[float]:
-    """
-    Extract first plausible price from a string.
-    Gumtree RSS often contains "$123" in title/summary.
-    """
+BAD_TERMS = re.compile(
+    r"\b(broken|faulty|repair|spares|not working|damaged|as[- ]is)\b",
+    re.IGNORECASE,
+)
+
+DURABLE_HINTS = re.compile(
+    r"\b(wood|metal|steel|solid|chair|table|bench|cabinet|tool|garden|outdoor)\b",
+    re.IGNORECASE,
+)
+
+
+def parse_price(text: str) -> Optional[int]:
     if not text:
         return None
-    m = _PRICE_RE.search(text.replace(",", ""))
+    m = PRICE_RE.search(text.replace(",", ""))
     if not m:
         return None
     try:
-        return float(m.group(1))
+        return int(m.group(1))
     except ValueError:
         return None
 
-def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-def matches_keywords(listing: Listing) -> bool:
-    kws = KEYWORDS.get(listing.feed_url, [])
-    if not kws:
-        return True
-    hay = normalize(f"{listing.title} {listing.link}")
-    return any(normalize(k) in hay for k in kws)
-
-def listing_id(listing: Listing) -> str:
+def listing_id(link: str, title: str) -> str:
     h = hashlib.sha256()
-    h.update((listing.link or listing.title).encode("utf-8", errors="ignore"))
+    h.update((link or title).encode("utf-8", errors="ignore"))
     return h.hexdigest()[:24]
 
-def now_utc_iso() -> str:
+
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
 # ----------------------------
-# SQLite storage
+# SQLite (dedupe only)
 # ----------------------------
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn):
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS seen (
             id TEXT PRIMARY KEY,
-            first_seen TEXT NOT NULL,
-            feed_url TEXT NOT NULL,
-            title TEXT NOT NULL,
-            link TEXT NOT NULL,
-            price REAL,
-            published TEXT
+            first_seen TEXT NOT NULL
         )
         """
     )
     conn.commit()
 
-def is_seen(conn: sqlite3.Connection, lid: str) -> bool:
+
+def seen(conn, lid: str) -> bool:
     cur = conn.execute("SELECT 1 FROM seen WHERE id = ?", (lid,))
     return cur.fetchone() is not None
 
-def mark_seen(conn: sqlite3.Connection, lid: str, listing: Listing) -> None:
+
+def mark_seen(conn, lid: str):
     conn.execute(
-        """
-        INSERT OR IGNORE INTO seen (id, first_seen, feed_url, title, link, price, published)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (lid, now_utc_iso(), listing.feed_url, listing.title, listing.link, listing.price, listing.published),
+        "INSERT OR IGNORE INTO seen (id, first_seen) VALUES (?, ?)",
+        (lid, now_iso()),
     )
     conn.commit()
 
-# ----------------------------
-# Instruction templates (fixed, non-adaptive)
-# ----------------------------
-
-def buy_instructions(listing: Listing, max_buy: float) -> str:
-    offer_open = max(1, int(max_buy * 0.75))  # simple fixed open anchor
-    offer_cap = int(max_buy)
-
-    msg = (
-        "BUY STAGE — DO THIS (ONE PASS)\n"
-        f"- Listing: {listing.title}\n"
-        f"- Link: {listing.link}\n"
-        f"- Seen price: {listing.price if listing.price is not None else 'unknown'}\n\n"
-        "1) Message seller (copy/paste):\n"
-        f"   \"Hi — is this still available? I can pick up today. Would you take ${offer_open}?\"\n\n"
-        "2) Your hard cap:\n"
-        f"   - Do NOT exceed: ${offer_cap}\n\n"
-        "3) Counter rule (ONE counter max):\n"
-        f"   - If they counter <= ${offer_cap}: accept.\n"
-        f"   - If they counter > ${offer_cap}: decline politely and stop.\n\n"
-        "4) Pickup constraint:\n"
-        "   - Only proceed if pickup time/location is concrete.\n"
-        "   - No long chats. No negotiation loops.\n"
-    )
-    return msg
-
-def sell_instructions(list_price: float, accept_at: float, floor: float) -> str:
-    midpoint = int((accept_at + floor) / 2)
-
-    msg = (
-        "SELL STAGE — DO THIS (ONE PASS)\n"
-        f"- List price: ${int(list_price)}\n"
-        f"- Accept at/above: ${int(accept_at)}\n"
-        f"- Floor: ${int(floor)}\n\n"
-        "Rules:\n"
-        f"1) If offer >= ${int(accept_at)}: ACCEPT.\n"
-        f"2) If offer < ${int(floor)}: DECLINE (polite) and STOP.\n"
-        f"3) If ${int(floor)} <= offer < ${int(accept_at)}:\n"
-        f"   - Counter ONCE at ${midpoint}.\n"
-        "   - If they don’t accept: STOP. No loops.\n\n"
-        "Listing copy (minimal):\n"
-        "\"Outdoor bar stools / stools. Sturdy frame, good condition. Pickup.\"\n"
-    )
-    return msg
-
-def combined_instructions(listing: Listing, bands: Tuple[float, float, float, float]) -> str:
-    max_buy, list_price, accept_at, floor = bands
-    return (
-        "=== DEAL RADAR: ACTION PACKET ===\n"
-        f"Category bands: max_buy=${int(max_buy)} | list=${int(list_price)} | accept>=${int(accept_at)} | floor=${int(floor)}\n\n"
-        + buy_instructions(listing, max_buy)
-        + "\n"
-        + sell_instructions(list_price, accept_at, floor)
-    )
 
 # ----------------------------
-# Email (optional)
+# Core logic
 # ----------------------------
 
-def send_email(subject: str, body: str) -> None:
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_TO and EMAIL_FROM):
-        logging.info("Email not configured; skipping email send.")
-        return
+def passed_gate(title: str, summary: str, price: Optional[int], max_buy: int) -> bool:
+    if not title or price is None:
+        return False
+    if price > max_buy or price <= 0:
+        return False
+    text = f"{title} {summary}"
+    if BAD_TERMS.search(text):
+        return False
+    if not DURABLE_HINTS.search(text):
+        return False
+    return True
 
-    import smtplib
-    from email.mime.text import MIMEText
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
+def ranges(max_buy: int, list_price: int) -> Tuple[str, str]:
+    buy_low = int(max_buy * 0.7)
+    buy_high = max_buy
+    sell_low = int(list_price * 0.85)
+    sell_high = int(list_price * 1.1)
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
-        s.starttls()
-        s.login(SMTP_USER, SMTP_PASS)
-        s.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+    buy_range = f"${buy_low}–${buy_high}"
+    sell_range = f"${sell_low}–${sell_high}"
+    return buy_range, sell_range
 
-    logging.info("Email sent to %s", EMAIL_TO)
 
 # ----------------------------
-# Core loop
+# Main loop
 # ----------------------------
 
-def extract_listing(feed_url: str, entry: Dict) -> Listing:
-    title = entry.get("title", "") or ""
-    link = entry.get("link", "") or ""
-    published = entry.get("published", None) or entry.get("updated", None)
-
-    # price often appears in title/summary
-    summary = entry.get("summary", "") or entry.get("description", "") or ""
-    price = parse_price(title) or parse_price(summary)
-
-    return Listing(feed_url=feed_url, title=title, link=link, price=price, published=published)
-
-def get_bands_for_listing(listing: Listing) -> Optional[Tuple[float, float, float, float]]:
-    cat = FEED_CATEGORY.get(listing.feed_url, "")
-    if not cat:
-        return None
-    bands = PRICE_BANDS.get(cat)
-    return bands
-
-def is_mispriced(listing: Listing, max_buy: float) -> bool:
-    # If price unknown, we still alert (you can decide).
-    if listing.price is None:
-        return True
-    return listing.price <= max_buy
-
-def main() -> None:
+def main():
     if not FEEDS:
-        logging.error("No FEEDS configured. Add Gumtree RSS feed URLs to FEEDS in this file.")
+        print("No feeds configured.")
         return
 
     with sqlite3.connect(DB_PATH) as conn:
         init_db(conn)
 
-        logging.info("Deal radar started. Polling %d feeds every %ds", len(FEEDS), POLL_SECONDS)
-
         while True:
             for feed_url in FEEDS:
-                try:
-                    d = feedparser.parse(feed_url)
-                    if d.bozo:
-                        logging.warning("Feed parse issue for %s", feed_url)
+                category = FEED_CATEGORY.get(feed_url)
+                logic = PRICE_LOGIC.get(category)
 
-                    for entry in d.entries[:50]:
-                        listing = extract_listing(feed_url, entry)
-                        if not listing.title and not listing.link:
-                            continue
+                if not category or not logic:
+                    continue
 
-                        if not matches_keywords(listing):
-                            continue
+                max_buy, list_price = logic
 
-                        lid = listing_id(listing)
-                        if is_seen(conn, lid):
-                            continue
+                feed = feedparser.parse(feed_url)
+                for entry in feed.entries[:50]:
+                    title = entry.get("title", "") or ""
+                    link = entry.get("link", "") or ""
+                    summary = entry.get("summary", "") or ""
 
-                        # mark as seen immediately to avoid repeats
-                        mark_seen(conn, lid, listing)
+                    price = parse_price(title) or parse_price(summary)
+                    lid = listing_id(link, title)
 
-                        bands = get_bands_for_listing(listing)
-                        if not bands:
-                            logging.info("Seen new listing (no bands configured): %s | %s", listing.title, listing.link)
-                            continue
+                    if seen(conn, lid):
+                        continue
 
-                        max_buy, list_price, accept_at, floor = bands
-                        if not is_mispriced(listing, max_buy):
-                            logging.info("New listing above max_buy ($%s): %s", int(max_buy), listing.title)
-                            continue
+                    mark_seen(conn, lid)
 
-                        packet = combined_instructions(listing, bands)
-                        print("\n" + packet + "\n")
+                    if not passed_gate(title, summary, price, max_buy):
+                        continue
 
-                        # Optional email
-                        subject = f"Deal Radar: {listing.title[:80]}"
-                        send_email(subject, packet)
+                    buy_r, sell_r = ranges(max_buy, list_price)
 
-                except Exception as e:
-                    logging.exception("Error polling feed %s: %s", feed_url, e)
+                    # SINGLE allowed task: review listing
+                    print("\n=== REVIEW LISTING ===")
+                    print(f"Title: {title}")
+                    print(f"Link: {link}")
+                    print(f"Seen price: ${price}")
+                    print(f"Reason: price ≤ max_buy and durability signal present")
+                    print("\nNon-binding ranges:")
+                    print(f"- Buy range:  {buy_r}")
+                    print(f"- Sell range: {sell_r}")
+                    print("Use judgment at contact time.")
+                    print("======================\n")
 
             time.sleep(POLL_SECONDS)
+
 
 if __name__ == "__main__":
     main()
