@@ -1,112 +1,137 @@
 #!/usr/bin/env python3
 """
-deal_radar_min.py — irreducible constraint-first deal monitor
+collapse_radar.py
 
-Principles:
-- Silence by default
-- Veto-first gating
-- One justified interruption only
-- No optimization, no learning, no escalation
+Terminal constraint-first deal detector.
 
-Action emitted:
-- REVIEW LISTING
+Invariant:
+- Silence is the default.
+- Action is emitted ONLY when an external fact forces it.
+- No suggestion, no optimisation, no decay, no pressure signals.
+
+This system detects ONLY externally-forced BUY events.
+It never suggests SELL actions or price changes.
+
+Dependencies:
+    pip install feedparser
 """
 
-import re
+import hashlib
+import sqlite3
 import time
+import re
+from datetime import datetime, timezone
+from typing import Optional
+
 import feedparser
 
-# ----------------------------
-# USER INPUT (only real knobs)
-# ----------------------------
+# =========================
+# USER CONFIG (explicit)
+# =========================
 
 FEEDS = [
     # Example:
-    # "https://www.gumtree.com.au/s-sydney/chairs/k0l3003435r10/rss",
+    # "https://www.gumtree.com.au/s-sydney/chairs/k0l3003435r10/rss"
 ]
 
-MAX_BUY_PRICE = 80        # hard ceiling
-POLL_SECONDS = 300        # 5 minutes
+MAX_BUY_PRICE = 50  # hard constraint, not a heuristic
+DB_PATH = "collapse_seen.sqlite"
+POLL_SECONDS = 300
 
-# ----------------------------
-# Hard veto terms (disqualifiers)
-# ----------------------------
-
-VETO_TERMS = re.compile(
-    r"\b(broken|faulty|repair|spares|not working|damaged|as[- ]is)\b",
-    re.IGNORECASE,
-)
+# =========================
+# INTERNALS
+# =========================
 
 PRICE_RE = re.compile(r"\$?\s*([0-9]{1,6})")
 
-# ----------------------------
-# Helpers
-# ----------------------------
-
-def parse_price(text: str):
+def extract_price(text: str) -> Optional[int]:
     if not text:
         return None
     m = PRICE_RE.search(text.replace(",", ""))
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except ValueError:
-        return None
+    return int(m.group(1)) if m else None
 
+def listing_id(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()[:24]
 
-def disqualified(text: str) -> bool:
-    return bool(VETO_TERMS.search(text))
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
+# =========================
+# STORAGE (minimal state)
+# =========================
 
-# ----------------------------
-# Core loop
-# ----------------------------
+def init_db(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS seen (
+            id TEXT PRIMARY KEY,
+            first_seen TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+def already_seen(conn, lid: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM seen WHERE id = ?", (lid,)
+    ).fetchone() is not None
+
+def mark_seen(conn, lid: str):
+    conn.execute(
+        "INSERT OR IGNORE INTO seen (id, first_seen) VALUES (?, ?)",
+        (lid, utc_now())
+    )
+    conn.commit()
+
+# =========================
+# COLLAPSE CONDITION
+# =========================
+
+def forced_buy_event(price: Optional[int]) -> bool:
+    """
+    Returns True ONLY if reality forces a decision.
+    Unknown price does NOT force action.
+    """
+    if price is None:
+        return False
+    return price <= MAX_BUY_PRICE
+
+# =========================
+# MAIN LOOP
+# =========================
 
 def main():
     if not FEEDS:
-        print("No feeds configured.")
-        return
+        raise RuntimeError("No feeds configured.")
 
-    seen = set()  # per-run only; not persistent
+    with sqlite3.connect(DB_PATH) as conn:
+        init_db(conn)
 
-    while True:
-        for feed_url in FEEDS:
-            feed = feedparser.parse(feed_url)
+        while True:
+            for feed_url in FEEDS:
+                feed = feedparser.parse(feed_url)
 
-            for entry in feed.entries[:50]:
-                title = entry.get("title", "") or ""
-                link = entry.get("link", "") or ""
-                summary = entry.get("summary", "") or ""
+                for entry in feed.entries:
+                    link = entry.get("link")
+                    if not link:
+                        continue
 
-                key = link or title
-                if not key or key in seen:
-                    continue
-                seen.add(key)
+                    lid = listing_id(link)
+                    if already_seen(conn, lid):
+                        continue
 
-                text = f"{title} {summary}"
+                    mark_seen(conn, lid)
 
-                # Hard veto first
-                if disqualified(text):
-                    continue
+                    title = entry.get("title", "")
+                    summary = entry.get("summary", "")
+                    price = extract_price(title) or extract_price(summary)
 
-                price = parse_price(text)
-                if price is None or price <= 0:
-                    continue
+                    if forced_buy_event(price):
+                        print("\n=== FORCED ACTION ===")
+                        print(f"TITLE: {title}")
+                        print(f"PRICE: ${price}")
+                        print(f"LINK:  {link}")
+                        print("====================\n")
 
-                if price > MAX_BUY_PRICE:
-                    continue
-
-                # ---- ONLY JUSTIFIED EMISSION ----
-                print("\n=== REVIEW LISTING ===")
-                print(f"Title: {title}")
-                print(f"Price: ${price}")
-                print(f"Link: {link}")
-                print("Reason: price ≤ ceiling and no disqualifiers")
-                print("======================\n")
-
-        time.sleep(POLL_SECONDS)
-
+            time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
     main()
