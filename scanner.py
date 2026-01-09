@@ -1,89 +1,149 @@
-import os,time,json,re,hashlib,requests,feedparser
-from datetime import datetime,timezone,timedelta
+# marketplace_field_scanner.py
+import time, math, sqlite3, requests, re
+from bs4 import BeautifulSoup
+from dataclasses import dataclass
 
-POLL=180
-MAX_ALERTS=8
-COOLDOWN=900
-STATE="state.json"
+DB = "field.db"
+POLL = 300
+THRESH = 0.7
+DECAY = 0.05
+STEP = 0.08
+COOLDOWN = 3600
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-ANCHORS={
-"dining chair":80,
-"office chair":120,
-"timber table":250
-}
+# ---------- model ----------
 
-BANNED=("broken","faulty","parts","repair","spares")
+@dataclass
+class Item:
+    source: str
+    id: str
+    title: str
+    price: float | None
+    created_ts: float
+    url: str
 
-PRICE_RE=re.compile(r"(\$|AUD\s*)([0-9][0-9,]*)")
+# ---------- utils ----------
 
-def now():return datetime.now(timezone.utc)
-def today():return now().date().isoformat()
+def now(): return time.time()
+def clamp(x,a,b): return max(a,min(b,x))
+def sig(x): return 1/(1+math.exp(-x))
 
-def load():
-    if not os.path.exists(STATE):
-        return {"seen":{}, "day":today(), "sent":0, "cool":0}
-    return json.load(open(STATE))
+# ---------- db ----------
 
-def save(s):
-    json.dump(s,open(STATE,"w"))
+def db():
+    c = sqlite3.connect(DB)
+    c.execute("PRAGMA journal_mode=WAL;")
+    return c
 
-def price(t):
-    m=PRICE_RE.search(t or "")
-    return float(m.group(2).replace(",","")) if m else None
+def init():
+    with db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS w(k TEXT PRIMARY KEY,v REAL,t REAL);
+        CREATE TABLE IF NOT EXISTS cd(k TEXT PRIMARY KEY,u REAL);
+        CREATE TABLE IF NOT EXISTS seen(s TEXT,i TEXT,PRIMARY KEY(s,i));
+        """)
 
-def uid(t,l):
-    return hashlib.sha1((t+l).encode()).hexdigest()
+def weight(k):
+    with db() as c:
+        r = c.execute("SELECT v,t FROM w WHERE k=?", (k,)).fetchone()
+        if not r: return 0.0
+        v,t = r
+        days = (now()-t)/86400
+        return v*((1-DECAY)**max(days,0))
 
-def under(p,a):
-    return (a-p)>=40 or ((a-p)/a)>=0.35
+def cooldown(k):
+    with db() as c:
+        r = c.execute("SELECT u FROM cd WHERE k=?", (k,)).fetchone()
+        return r and now()<r[0]
 
-def rss_urls():
-    env=os.getenv("FASTCASH_RSS_URLS","")
-    return [u for u in env.splitlines() if u.strip()]
+def seen(item):
+    with db() as c:
+        r = c.execute("SELECT 1 FROM seen WHERE s=? AND i=?", (item.source,item.id)).fetchone()
+        if r: return True
+        c.execute("INSERT INTO seen VALUES(?,?)", (item.source,item.id))
+        return False
 
-def notify(msg):
-    tok=os.getenv("FASTCASH_TELEGRAM_TOKEN")
-    cid=os.getenv("FASTCASH_TELEGRAM_CHAT_ID")
-    if tok and cid:
-        requests.post(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
-            json={"chat_id":cid,"text":msg},
-            timeout=10
-        )
+# ---------- field logic ----------
 
-def scan(e,s):
-    t=(e.get("title","")+e.get("summary","")).lower()
-    if any(b in t for b in BANNED):return
-    p=price(t)
-    if not p or p<25 or p>900:return
-    k=next((k for k in ANCHORS if k in t),None)
-    if not k:return
-    if not under(p,ANCHORS[k]):return
-    if s["sent"]>=MAX_ALERTS or time.time()<s["cool"]:return
-    notify(f"{k} ${p}\n{e.get('link','')}")
-    s["sent"]+=1
-    s["cool"]=time.time()+COOLDOWN
+def keys(item):
+    major = item.title.lower().split()[0] if item.title else "x"
+    return {
+        "src": f"s:{item.source}",
+        "maj": f"m:{major}",
+    }
 
-def main():
-    s=load()
-    if s["day"]!=today():
-        s["day"]=today()
-        s["sent"]=0
-    urls=rss_urls()
+def base_exc(item):
+    b = 0.0
+    if item.price is not None:
+        b += clamp(1/(1+item.price),0,0.25)
+    age_h = (now()-item.created_ts)/3600
+    b += clamp(math.exp(-age_h/12)*0.25,0,0.25)
+    return b
+
+def excitation(item):
+    x = base_exc(item)
+    damp = 1.0
+    for k in keys(item).values():
+        if cooldown(k): damp *= 0.5
+        x += clamp(weight(k), -0.35, 0.35)
+    return clamp(sig(3*(x-0.35))*damp,0,1)
+
+# ---------- scanners ----------
+
+def scan_gumtree(url):
+    html = requests.get(url, headers=HEADERS, timeout=15).text
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    for a in soup.select("a[data-q='search-result-anchor']"):
+        title = a.get_text(strip=True)
+        href = "https://www.gumtree.com.au" + a["href"]
+        price = None
+        m = re.search(r"\$(\d+)", title)
+        if m: price = float(m.group(1))
+        items.append(Item(
+            "gumtree",
+            href.split("/")[-1],
+            title,
+            price,
+            now(),
+            href
+        ))
+    return items
+
+def scan_fb(url):
+    html = requests.get(url, headers=HEADERS, timeout=15).text
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    for a in soup.find_all("a", href=True):
+        if "/marketplace/item/" in a["href"]:
+            title = a.get_text(strip=True)
+            if not title: continue
+            href = "https://www.facebook.com" + a["href"]
+            items.append(Item(
+                "fb",
+                href.split("/")[-1],
+                title,
+                None,
+                now(),
+                href
+            ))
+    return items
+
+# ---------- loop ----------
+
+def run():
+    init()
+    GUMTREE_URL = "https://www.gumtree.com.au/s-all-results.html?sort=datedesc"
+    FB_URL = "https://www.facebook.com/marketplace/"
+
     while True:
-        for u in urls:
-            try:
-                f=feedparser.parse(requests.get(u,timeout=10).content)
-                for e in f.entries:
-                    i=uid(e.get("title",""),e.get("link",""))
-                    if i in s["seen"]:continue
-                    s["seen"][i]=1
-                    scan(e,s)
-            except:pass
-        if len(s["seen"])>4000:
-            for k in list(s["seen"])[:1000]:
-                del s["seen"][k]
-        save(s)
+        for item in scan_gumtree(GUMTREE_URL) + scan_fb(FB_URL):
+            if seen(item): continue
+            exc = excitation(item)
+            if exc >= THRESH:
+                print(f"[NOTIFY] {item.source} exc={exc:.2f} {item.title}")
+                print(item.url)
         time.sleep(POLL)
 
-main()
+if __name__ == "__main__":
+    run()
